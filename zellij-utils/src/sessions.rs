@@ -146,18 +146,36 @@ pub fn get_sessions_sorted_by_mtime() -> anyhow::Result<Vec<String>> {
 /// On Windows, reads the server PID from the marker file and checks process liveness.
 #[cfg(unix)]
 fn assert_socket(name: &str) -> bool {
+    socket_is_live(&ZELLIJ_SOCK_DIR.join(name))
+}
+
+// Probe a Zellij server's IPC socket and report whether a live server is
+// listening. The probe connects, sends `ConnStatus`, and reads one message:
+//
+// * any reply              ⇒ alive (a server is sitting on the socket and
+//                            responding to traffic — that's what "live" means
+//                            here; the older behaviour of only accepting
+//                            `Connected` mis-classified live-but-busy servers
+//                            as dead when the route thread happened to push
+//                            an unrelated message — e.g. `QueryTerminalSize`
+//                            during layout — to the probe connection first)
+// * no reply (clean EOF)   ⇒ dead
+// * `ConnectionRefused`    ⇒ dead, and remove the stale socket file
+// * any other connect err  ⇒ dead
+//
+// Note: this still requires the server to have responded with *something*, so
+// it is strictly stronger than "the path is connectable". Anything that arrived
+// is proof the server is alive — we don't care which variant it is.
+#[cfg(unix)]
+fn socket_is_live(path: &std::path::Path) -> bool {
     use crate::consts::ipc_connect;
-    let path = &*ZELLIJ_SOCK_DIR.join(name);
     match ipc_connect(path) {
         Ok(stream) => {
             let mut sender: IpcSenderWithContext<ClientToServerMsg> =
                 IpcSenderWithContext::new(stream);
             let _ = sender.send_client_msg(ClientToServerMsg::ConnStatus);
             let mut receiver: IpcReceiverWithContext<ServerToClientMsg> = sender.get_receiver();
-            match receiver.recv_server_msg() {
-                Some((ServerToClientMsg::Connected, _)) => true,
-                None | Some((_, _)) => false,
-            }
+            receiver.recv_server_msg().is_some()
         },
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
             drop(fs::remove_file(path));
@@ -802,3 +820,56 @@ const NOUNS: &[&'static str] = &[
     "yak",
     "zebra",
 ];
+
+#[cfg(all(test, unix))]
+mod socket_liveness_tests {
+    use super::socket_is_live;
+    use crate::consts::ipc_bind;
+    use crate::ipc::{IpcSenderWithContext, ServerToClientMsg};
+    use interprocess::local_socket::traits::ListenerExt;
+    use std::thread;
+
+    // Regression for the "There is no active session!" race under load.
+    //
+    // A busy zellij server (e.g. many sessions starting at once) registers each
+    // incoming connection as a client at accept time and pushes valid but
+    // unrelated messages — `QueryTerminalSize` during layout, render traffic,
+    // etc. — to that connection BEFORE the route thread gets around to answering
+    // the discovery probe's `ConnStatus` with `Connected`. On a throwaway probe
+    // connection it may not answer `Connected` at all. A server that responds at
+    // all is unambiguously alive, so `socket_is_live` must report it alive on
+    // any reply.
+    #[test]
+    fn live_session_socket_is_alive_when_server_does_not_reply_connected_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dev-env");
+        let listener = ipc_bind(&path).expect("bind session socket");
+        let server = thread::spawn(move || {
+            if let Some(Ok(conn)) = listener.incoming().next() {
+                let mut sender: IpcSenderWithContext<ServerToClientMsg> =
+                    IpcSenderWithContext::new(conn);
+                // Busy server: an unrelated message first, and no `Connected`.
+                let _ = sender.send_server_msg(ServerToClientMsg::QueryTerminalSize);
+            }
+        });
+        assert!(
+            socket_is_live(&path),
+            "a session whose server is listening must be reported alive even when the server \
+             does not answer the ConnStatus probe with `Connected` first (busy server under load)"
+        );
+        let _ = server.join();
+    }
+
+    // A socket path with no server listening must be reported dead (sanity check
+    // that the desired fix must not over-broadly report everything alive).
+    #[test]
+    fn socket_with_no_listener_is_reported_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dev-env");
+        drop(ipc_bind(&path).expect("bind session socket"));
+        assert!(
+            !socket_is_live(&path),
+            "a socket with no live server must be reported dead"
+        );
+    }
+}
