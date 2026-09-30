@@ -788,6 +788,10 @@ impl SessionState {
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "./unit/server_tests.rs"]
+mod server_tests;
+
 #[cfg(test)]
 mod session_state_tests {
     use super::*;
@@ -1455,22 +1459,22 @@ pub fn start_server_impl(
                     }
                     // Handle regular client removal
                     remove_client!(client_id, os_input, session_state, session_data);
-                    session_data
-                        .write()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap()
-                        .senders
-                        .send_to_screen(ScreenInstruction::RemoveClient(client_id))
-                        .unwrap();
-                    session_data
-                        .write()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap()
-                        .senders
-                        .send_to_plugin(PluginInstruction::RemoveClient(client_id))
-                        .unwrap();
+                    // A client can disconnect before the session exists: every
+                    // connection's route thread sends RemoveClient when it
+                    // exits, so a session-discovery probe (ConnStatus) or CLI
+                    // client that connects right after `attach -b` can get
+                    // here before the creating client's FirstClientConnected.
+                    // There is no screen or plugin thread to notify yet.
+                    if let Some(session_data) = session_data.write().unwrap().as_ref() {
+                        session_data
+                            .senders
+                            .send_to_screen(ScreenInstruction::RemoveClient(client_id))
+                            .unwrap();
+                        session_data
+                            .senders
+                            .send_to_plugin(PluginInstruction::RemoveClient(client_id))
+                            .unwrap();
+                    }
                 }
             },
             ServerInstruction::SendWebClientsForbidden(client_id) => {

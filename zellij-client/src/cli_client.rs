@@ -13,8 +13,10 @@ use zellij_utils::{
     data::PaneId,
     errors::prelude::*,
     input::actions::Action,
-    ipc::{ClientToServerMsg, ExitReason, ServerToClientMsg},
+    ipc::{ClientToServerMsg, ExitReason, IpcReceiveError, ServerToClientMsg},
 };
+
+const SERVER_DISCONNECTED: &str = "Lost connection to the Zellij server";
 
 pub fn start_cli_client(
     mut os_input: Box<dyn ClientOsApi>,
@@ -160,8 +162,8 @@ fn pipe_client(
         }
         loop {
             // wait for a response and act accordingly
-            match os_input.recv_from_server() {
-                Some((ServerToClientMsg::UnblockCliPipeInput { pipe_name }, _)) => {
+            match os_input.try_recv_from_server() {
+                Ok((ServerToClientMsg::UnblockCliPipeInput { pipe_name }, _)) => {
                     // unblock this pipe, meaning we need to stop waiting for a response and read
                     // once more from STDIN
                     if pipe_name == pipe_id {
@@ -174,7 +176,7 @@ fn pipe_client(
                         }
                     }
                 },
-                Some((ServerToClientMsg::CliPipeOutput { pipe_name, output }, _)) => {
+                Ok((ServerToClientMsg::CliPipeOutput { pipe_name, output }, _)) => {
                     // send data to STDOUT, this *does not* mean we need to unblock the input
                     let err_context = "Failed to write to stdout";
                     if pipe_name == pipe_id {
@@ -186,15 +188,15 @@ fn pipe_client(
                         stdout.flush().context(err_context).non_fatal();
                     }
                 },
-                Some((ServerToClientMsg::Log { lines: log_lines }, _)) => {
+                Ok((ServerToClientMsg::Log { lines: log_lines }, _)) => {
                     log_lines.iter().for_each(|line| println!("{line}"));
                     process::exit(0);
                 },
-                Some((ServerToClientMsg::LogError { lines: log_lines }, _)) => {
+                Ok((ServerToClientMsg::LogError { lines: log_lines }, _)) => {
                     log_lines.iter().for_each(|line| eprintln!("{line}"));
                     process::exit(2);
                 },
-                Some((ServerToClientMsg::Exit { exit_reason }, _)) => match exit_reason {
+                Ok((ServerToClientMsg::Exit { exit_reason }, _)) => match exit_reason {
                     ExitReason::Error(e) => {
                         eprintln!("{}", e);
                         process::exit(2);
@@ -202,6 +204,10 @@ fn pipe_client(
                     _ => {
                         process::exit(0);
                     },
+                },
+                Err(IpcReceiveError::Disconnected) => {
+                    eprintln!("{}", SERVER_DISCONNECTED);
+                    process::exit(2);
                 },
                 _ => {},
             }
@@ -229,19 +235,19 @@ fn individual_messages_client(
     };
     os_input.send_to_server(msg);
     loop {
-        match os_input.recv_from_server() {
-            Some((ServerToClientMsg::UnblockInputThread, _)) if !is_blocking => {
+        match os_input.try_recv_from_server() {
+            Ok((ServerToClientMsg::UnblockInputThread, _)) if !is_blocking => {
                 return None;
             },
-            Some((ServerToClientMsg::Log { lines: log_lines }, _)) => {
+            Ok((ServerToClientMsg::Log { lines: log_lines }, _)) => {
                 log_lines.iter().for_each(|line| println!("{line}"));
                 return None;
             },
-            Some((ServerToClientMsg::LogError { lines: log_lines }, _)) => {
+            Ok((ServerToClientMsg::LogError { lines: log_lines }, _)) => {
                 log_lines.iter().for_each(|line| eprintln!("{line}"));
                 return Some(2);
             },
-            Some((ServerToClientMsg::Exit { exit_reason }, _)) => match exit_reason {
+            Ok((ServerToClientMsg::Exit { exit_reason }, _)) => match exit_reason {
                 ExitReason::Error(e) => {
                     eprintln!("{}", e);
                     return Some(2);
@@ -252,6 +258,10 @@ fn individual_messages_client(
                 _ => {
                     return None;
                 },
+            },
+            Err(IpcReceiveError::Disconnected) => {
+                eprintln!("{}", SERVER_DISCONNECTED);
+                return Some(2);
             },
             _ => {},
         }
@@ -364,3 +374,7 @@ pub fn start_subscribe_client(
 
     os_input.send_to_server(ClientToServerMsg::ClientExited);
 }
+
+#[cfg(test)]
+#[path = "./unit/cli_client_tests.rs"]
+mod cli_client_tests;
